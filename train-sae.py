@@ -22,7 +22,7 @@ from sequence_models.constants import MSA_ALPHABET
 from evodiff.data import TRRMSADataset, A3MMSADataset
 from sequence_models.collaters import MSAAbsorbingCollater
 from sequence_models.samplers import SortishSampler, ApproxBatchSampler
-from sequence_models.losses import MaskedCrossEntropyLossMSA, MaskedCrossEntropyLossMSA_SAE
+from sequence_models.losses import MaskedCrossEntropyLossMSA
 from evodiff.metrics import MaskedAccuracyMSA
 from torch.utils.data import Subset
 from sequence_models.utils import warmup, transformer_lr
@@ -272,7 +272,7 @@ def train(gpu, args):
                 print(f'Unexpected keys when loading checkpoint: {len(unexpected)}')
         else:
             model.load_state_dict(msd)
-
+        # TO CHECK！
         try:
             optimizer.load_state_dict(sd['optimizer_state_dict'])
             scheduler.load_state_dict(sd['scheduler_state_dict'])
@@ -290,9 +290,8 @@ def train(gpu, args):
     model = model.to(device)
     model = DDP(model, device_ids=[gpu + args.offset], output_device=args.offset)
 
-    if args.mask == 'oadm-sae': # use the SAE loss function
-        loss_func = MaskedCrossEntropyLossMSA_SAE(ignore_index=padding_idx)
-    elif args.mask == 'oadm':
+    # these loss functions are irrelevant for sae training
+    if args.mask == 'oadm':
         loss_func = MaskedCrossEntropyLossMSA(ignore_index=padding_idx)
     elif args.mask == 'blosum' or args.mask == 'random':
         # Austin = LVB + lambda * CE
@@ -484,11 +483,10 @@ def train(gpu, args):
             loss = (lvb_loss + _lambda * ce_loss) * n_tokens
         elif args.mask == 'oadm-sae':
             outputs = model(src)
-            ce_loss, nll_loss = loss_func(outputs, tgt, mask, nonpad_mask)
             sae_loss = model.module.sae_loss if hasattr(model, 'module') else model.sae_loss
             if sae_loss is None:
-                sae_loss = torch.tensor(0.0, device=ce_loss.device)
-            loss = ce_loss + sae_loss
+                sae_loss = torch.tensor(0.0, device=device)
+            loss = sae_loss
             accu = accu_func(outputs, tgt, mask) * n_tokens
 
         if split == 'train':
@@ -502,7 +500,7 @@ def train(gpu, args):
                scheduler.step()
 
         n_seqs = torch.tensor(len(src), device=device)
-        return loss, nll_loss, accu, n_tokens, n_seqs, n_processed
+        return loss, accu, n_tokens, n_seqs, n_processed
 
     n_parameters = sum(p.numel() for p in model.parameters())
     if rank == 0:

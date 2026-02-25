@@ -17,7 +17,7 @@ class SparseAutoencoder(nn.Module):
     def forward(self, x):
         z = F.relu(self.encoder(x))
         x_recon = self.decoder(z)
-        sae_loss = self.l1_coeff * z.abs().mean()
+        sae_loss = ((x_recon - x)**2).sum(dim=-1).mean() + self.l1_coeff * z.abs().mean() # to check dimension.
         return x_recon, sae_loss
 
 class MSATransformerSAE(nn.Module):
