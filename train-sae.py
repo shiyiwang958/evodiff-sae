@@ -17,17 +17,41 @@ from evodiff.collaters import D3PMCollaterMSA
 from evodiff.utils import Tokenizer
 from evodiff.losses import  D3PMCELoss,  D3PMLVBLossMSA
 from evodiff.model import MSATransformerTime
-from evodiff.msa_transformer_sae import MSATransformer
+from evodiff.msa_transformer_sae import MSATransformerSAE
 from sequence_models.constants import MSA_ALPHABET
 from evodiff.data import TRRMSADataset, A3MMSADataset
 from sequence_models.collaters import MSAAbsorbingCollater
 from sequence_models.samplers import SortishSampler, ApproxBatchSampler
-from sequence_models.losses import MaskedCrossEntropyLossMSA
+from sequence_models.losses import MaskedCrossEntropyLossMSA, MaskedCrossEntropyLossMSA_SAE
 from evodiff.metrics import MaskedAccuracyMSA
 from torch.utils.data import Subset
 from sequence_models.utils import warmup, transformer_lr
 
 home = str(pathlib.Path.home())
+
+
+def _strip_module_prefix(state_dict):
+    return {
+        (k[len('module.'):] if k.startswith('module.') else k): v
+        for k, v in state_dict.items()
+    }
+
+
+def _remap_legacy_msa_to_sae_state_dict(state_dict, insertion_layer):
+    remapped = {}
+    for key, value in state_dict.items():
+        if key.startswith('layers.'):
+            parts = key.split('.')
+            layer_idx = int(parts[1])
+            suffix = '.'.join(parts[2:])
+            if layer_idx <= insertion_layer:
+                new_key = f'layers_before.{layer_idx}.{suffix}'
+            else:
+                new_key = f'layers_after.{layer_idx - insertion_layer - 1}.{suffix}'
+            remapped[new_key] = value
+        else:
+            remapped[key] = value
+    return remapped
 
 def main():
     parser = argparse.ArgumentParser()
@@ -50,7 +74,7 @@ def main():
     parser.add_argument('-sd', '--state_dict', default=None)
     parser.add_argument('--decay', action='store_true')
     parser.add_argument('--dummy', required=False)
-    parser.add_argument('--mask', default='blosum')
+    parser.add_argument('--mask', default='oadm-sae', type=str) # options: 'oadm-sae', 'oadm', 'blosum', 'random'
     parser.add_argument('--checkpoint_freq', type=float, default=120)  # in minutes
     parser.add_argument('--weight-save-freq', type=float, default=None)  # in minutes
     parser.add_argument('--log-freq', type=float, default=1000)  # in steps
@@ -91,6 +115,7 @@ def train(gpu, args):
     d_hidden = config['d_hidden']
     n_layers = config['n_layers']
     n_heads = config['n_heads']
+    insertion_layer = config.get('insertion_layer', n_layers - 1)
     bucket_size = config['bucket_size']
     max_tokens = config['max_tokens']
     max_batch_size = config['max_batch_size']
@@ -121,7 +146,7 @@ def train(gpu, args):
         ptjob = False
 
     # build datasets, samplers, and loaders
-    if args.mask == 'oadm':
+    if args.mask == 'oadm-sae': # sae builds datasets the same way as oadm
         tokenizer = Tokenizer()
         collater = MSAAbsorbingCollater(alphabet=MSA_ALPHABET)
         diffusion_timesteps = None # Not input to model
@@ -204,8 +229,9 @@ def train(gpu, args):
                                   num_workers=8)
 
     # Initiate model
-    if args.mask == 'oadm':
-        model = MSATransformer(d_embed, d_hidden, n_layers, n_heads, use_ckpt=True, n_tokens=len(MSA_ALPHABET),
+    if args.mask == 'oadm-sae':
+        model = MSATransformerSAE(d_embed, d_hidden, n_layers, n_heads, insertion_layer=insertion_layer,
+                               use_ckpt=True, n_tokens=len(MSA_ALPHABET),
                                padding_idx=padding_idx, mask_idx=masking_idx).cuda()
     else:
         model = MSATransformerTime(d_embed, d_hidden, n_layers, n_heads, timesteps=diffusion_timesteps, use_ckpt=True,
@@ -227,15 +253,32 @@ def train(gpu, args):
                 if epoch > last_epoch:
                     args.state_dict = args.out_fpath + output
                     last_epoch = epoch
+
+    # loading checkpoints                
     if args.state_dict is not None:
         print('Loading weights from ' + args.state_dict + '...')
         sd = torch.load(args.state_dict, map_location=torch.device('cpu'))
-        msd = sd['model_state_dict']
-        msd = {k.split('module.')[1]: v for k, v in msd.items()}
-        model.load_state_dict(msd)
-        optimizer.load_state_dict(sd['optimizer_state_dict'])
-        scheduler.load_state_dict(sd['scheduler_state_dict'])
-        scaler.load_state_dict(sd['scaler_state_dict']),
+        msd = _strip_module_prefix(sd['model_state_dict'])
+
+        if args.mask == 'oadm-sae' and any(k.startswith('layers.') for k in msd):
+            print(f'Remapping legacy MSATransformer layers into SAE split at insertion_layer={insertion_layer}')
+            msd = _remap_legacy_msa_to_sae_state_dict(msd, insertion_layer)
+
+        if args.mask == 'oadm-sae':
+            missing, unexpected = model.load_state_dict(msd, strict=False)
+            if missing:
+                print(f'Missing keys when loading checkpoint (expected for new SAE params): {len(missing)}')
+            if unexpected:
+                print(f'Unexpected keys when loading checkpoint: {len(unexpected)}')
+        else:
+            model.load_state_dict(msd)
+
+        try:
+            optimizer.load_state_dict(sd['optimizer_state_dict'])
+            scheduler.load_state_dict(sd['scheduler_state_dict'])
+            scaler.load_state_dict(sd['scaler_state_dict'])
+        except Exception as exc:
+            print(f'Could not restore optimizer/scheduler/scaler state from checkpoint: {exc}')
         initial_epoch = sd['epoch'] + 1
         total_steps = sd['step']
         total_tokens = sd['tokens']
@@ -247,7 +290,9 @@ def train(gpu, args):
     model = model.to(device)
     model = DDP(model, device_ids=[gpu + args.offset], output_device=args.offset)
 
-    if args.mask == 'oadm':
+    if args.mask == 'oadm-sae': # use the SAE loss function
+        loss_func = MaskedCrossEntropyLossMSA_SAE(ignore_index=padding_idx)
+    elif args.mask == 'oadm':
         loss_func = MaskedCrossEntropyLossMSA(ignore_index=padding_idx)
     elif args.mask == 'blosum' or args.mask == 'random':
         # Austin = LVB + lambda * CE
@@ -437,10 +482,13 @@ def train(gpu, args):
             nll_loss = ce_loss * n_tokens
             accu = accu_func(outputs, tgt, nonpad_mask) * n_tokens
             loss = (lvb_loss + _lambda * ce_loss) * n_tokens
-        elif args.mask == 'oadm':
+        elif args.mask == 'oadm-sae':
             outputs = model(src)
             ce_loss, nll_loss = loss_func(outputs, tgt, mask, nonpad_mask)
-            loss = ce_loss
+            sae_loss = model.module.sae_loss if hasattr(model, 'module') else model.sae_loss
+            if sae_loss is None:
+                sae_loss = torch.tensor(0.0, device=ce_loss.device)
+            loss = ce_loss + sae_loss
             accu = accu_func(outputs, tgt, mask) * n_tokens
 
         if split == 'train':

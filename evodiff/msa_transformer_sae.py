@@ -6,7 +6,21 @@ from torch.utils.checkpoint import checkpoint
 from esm.modules import TransformerLayer, LearnedPositionalEmbedding, ESM1bLayerNorm, AxialTransformerLayer
 from sequence_models.constants import PROTEIN_ALPHABET, PAD, MASK
 
-class MSATransformer(nn.Module):
+
+class SparseAutoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, l1_coeff=1e-3):
+        super().__init__()
+        self.encoder = nn.Linear(input_dim, hidden_dim)
+        self.decoder = nn.Linear(hidden_dim, input_dim)
+        self.l1_coeff = l1_coeff
+
+    def forward(self, x):
+        z = F.relu(self.encoder(x))
+        x_recon = self.decoder(z)
+        sae_loss = self.l1_coeff * z.abs().mean()
+        return x_recon, sae_loss
+
+class MSATransformerSAE(nn.Module):
     """
     Based on implementation described by Rao et al. in "MSA Transformer"
     https://doi.org/10.1101/2021.02.12.430858
@@ -22,22 +36,36 @@ class MSATransformer(nn.Module):
            number of attention heads
    """
 
-    def __init__(self, d_model, d_hidden, n_layers, n_heads, use_ckpt=False, n_tokens=len(PROTEIN_ALPHABET),
+    def __init__(self, d_model, d_hidden, n_layers, n_heads, insertion_layer, use_ckpt=False, n_tokens=len(PROTEIN_ALPHABET),
                  padding_idx=PROTEIN_ALPHABET.index(PAD), mask_idx=PROTEIN_ALPHABET.index(MASK),
                  max_positions=1024, tie_weights=True):
-        super(MSATransformer, self).__init__()
+        super(MSATransformerSAE, self).__init__()
         self.embed_tokens = nn.Embedding(
             n_tokens, d_model, padding_idx=mask_idx
         )
-        self.layers = nn.ModuleList(
+        if insertion_layer < 0 or insertion_layer >= n_layers:
+            raise ValueError(f"insertion_layer must be in [0, {n_layers - 1}], got {insertion_layer}")
+        self.insertion_layer = insertion_layer
+        
+        self.layers_before = nn.ModuleList(
             [
                 AxialTransformerLayer(
                     d_model, d_hidden, n_heads
                 )
-                for _ in range(n_layers)
+                for _ in range(insertion_layer + 1)
+            ]
+        )
+        self.sae = SparseAutoencoder(d_model, d_hidden)
+        self.layers_after = nn.ModuleList(
+            [
+                AxialTransformerLayer(
+                    d_model, d_hidden, n_heads
+                )
+                for _ in range(n_layers - insertion_layer - 1)
             ]
         )
         self.padding_idx = padding_idx
+        self.sae_loss = None
 
         # self.contact_head = ContactPredictionHead()
         self.embed_positions = LearnedPositionalEmbedding(max_positions, d_model, padding_idx)
@@ -72,8 +100,19 @@ class MSATransformer(nn.Module):
         # B x R x C x D -> R x C x B x D
         x = x.permute(1, 2, 0, 3)
 
-        for layer_idx, layer in enumerate(self.layers):
-            x = checkpoint(layer, x, None, padding_mask, False, use_reentrant=True)
+        for layer in self.layers_before:
+            if self.use_ckpt:
+                x = checkpoint(layer, x, None, padding_mask, False, use_reentrant=True)
+            else:
+                x = layer(x, None, padding_mask, False)
+
+        x, self.sae_loss = self.sae(x)
+
+        for layer in self.layers_after:
+            if self.use_ckpt:
+                x = checkpoint(layer, x, None, padding_mask, False, use_reentrant=True)
+            else:
+                x = layer(x, None, padding_mask, False)
 
         x = self.emb_layer_norm_after(x)
         x = x.permute(2, 0, 1, 3)  # R x C x B x D -> B x R x C x D
