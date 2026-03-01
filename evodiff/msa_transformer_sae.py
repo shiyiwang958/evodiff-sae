@@ -13,11 +13,14 @@ class SparseAutoencoder(nn.Module):
         self.encoder = nn.Linear(input_dim, hidden_dim)
         self.decoder = nn.Linear(hidden_dim, input_dim)
         self.l1_coeff = l1_coeff
+        self.hidden_dim = hidden_dim
 
-    def forward(self, x):
+    def forward(self, x, pads):
         z = F.relu(self.encoder(x))
         x_recon = self.decoder(z)
-        sae_loss = ((x_recon - x)**2).sum(dim=-1).mean() + self.l1_coeff * z.abs().mean() # to check dimension.
+        # Divide by the batch size in the loss
+        sae_loss = ((x_recon - x)**2).sum() / (self.hidden_dim * x.shape[2]) + self.l1_coeff * z.abs().sum() / (self.hidden_dim * x.shape[2]) # loss should only be evaluated on non-padded positions
+        # to implement a Cross-Entropy loss
         return x_recon, sae_loss
 
 class MSATransformerSAE(nn.Module):

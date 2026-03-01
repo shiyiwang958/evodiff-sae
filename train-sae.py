@@ -127,6 +127,7 @@ def train(gpu, args):
     min_depth = config['n_sequences'] # Will filter out sequences smaller than this number
     max_seq_len = config['max_seq_len']
     config['decay'] = args.decay
+    method=config['method'] # use different losses for method = 'mask' or 'unmask'
     if 'clip' in config:
         clip = config['clip']
     else:
@@ -482,7 +483,7 @@ def train(gpu, args):
             accu = accu_func(outputs, tgt, nonpad_mask) * n_tokens
             loss = (lvb_loss + _lambda * ce_loss) * n_tokens
         elif args.mask == 'oadm-sae':
-            outputs = model(src)
+            outputs = model(src, nonpad_mask, input_mask, method=method) # model now expects nonpad and input masks
             sae_loss = model.module.sae_loss if hasattr(model, 'module') else model.sae_loss
             if sae_loss is None:
                 sae_loss = torch.tensor(0.0, device=device)

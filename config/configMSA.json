@@ -14,5 +14,6 @@
   "n_sequences": 64,
   "max_seq_len": 512,
   "diffusion_timesteps": 500,
-  "clip": 1.0
+  "clip": 1.0,
+  "method": "mask"
 }
