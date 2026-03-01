@@ -15,11 +15,20 @@ class SparseAutoencoder(nn.Module):
         self.l1_coeff = l1_coeff
         self.hidden_dim = hidden_dim
 
-    def forward(self, x, pads):
+    def forward(self, x, nonpad_mask, input_mask, method="unmask"):
         z = F.relu(self.encoder(x))
         x_recon = self.decoder(z)
+        nonpad_mask = nonpad_mask.permute(1, 2, 0).unsqueeze(-1) # R x C x B -> R x C x B x 1
+        input_mask = input_mask.permute(1, 2, 0).unsqueeze(-1) # R x C x B -> R x C x B x 1
         # Divide by the batch size in the loss
-        sae_loss = ((x_recon - x)**2).sum() / (self.hidden_dim * x.shape[2]) + self.l1_coeff * z.abs().sum() / (self.hidden_dim * x.shape[2]) # loss should only be evaluated on non-padded positions
+        if method == "unmask": # only evaluate loss on unmasked positions
+            sae_loss = ((x_recon - x)**2 * nonpad_mask * input_mask).sum() / (self.hidden_dim * x.shape[2]) + self.l1_coeff * (z * nonpad_mask * input_mask).abs().sum() / (self.hidden_dim * x.shape[2]) # loss evaluated on non-padded positions
+        elif method == "mask": # only evaluate loss on masked positions
+            sae_loss = ((x_recon - x)**2 * nonpad_mask * (1 - input_mask)).sum() / (self.hidden_dim * x.shape[2]) + self.l1_coeff * (z * nonpad_mask * (1 - input_mask)).abs().sum() / (self.hidden_dim * x.shape[2]) # loss evaluated on non-padded positions
+        elif method == "all": # evaluate loss on all positions
+            sae_loss = ((x_recon - x)**2).sum() / (self.hidden_dim * x.shape[2]) + self.l1_coeff * z.abs().sum() / (self.hidden_dim * x.shape[2])
+        else:
+            raise ValueError(f"Invalid method {method}, must be one of ['unmask', 'mask', 'all']")
         # to implement a Cross-Entropy loss
         return x_recon, sae_loss
 
@@ -89,7 +98,7 @@ class MSATransformerSAE(nn.Module):
 
         self.use_ckpt = use_ckpt
 
-    def forward(self, tokens):
+    def forward(self, tokens, nonpad_mask, input_mask, method="unmask"):
         assert tokens.ndim == 3
         batch_size, num_alignments, seqlen = tokens.size()
         padding_mask = tokens.eq(self.padding_idx)  # B, R, C
@@ -109,7 +118,7 @@ class MSATransformerSAE(nn.Module):
             else:
                 x = layer(x, None, padding_mask, False)
 
-        x, self.sae_loss = self.sae(x)
+        x, self.sae_loss = self.sae(x, nonpad_mask, input_mask, method)
 
         for layer in self.layers_after:
             if self.use_ckpt:
